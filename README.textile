@@ -1,0 +1,340 @@
+h1. Mediaprocessor 
+
+* scalable and flexible api for files convertion
+* supports s3, scp, local file storage
+* ready conversion routines for 
+** image (@RMagick@)
+** video (@ffmpeg@) - also creates images from random frame of video
+** audio (@ffmpeg@) files
+* simple configuration
+* runs on ruby 1.8.7 and 1.9.1
+
+h1. Main concept
+
+pre. 
+ -----------
+|           | is separated Sinatra application which you can
+|    API    | run on mongrel, unicorn, passenger, etc...
+|           | (files main.rb and config.ru)
+|           | 
+ -----------
+
+pre. 
+mediaprocessor application (ruby >=1.9.1)
+ -----------   ---------- 
+|           | |          |
+|   http    | |   file   | downloaders
+|           | |          |
+|           | |          |
+ -----------   ---------- 
+  5 threads     1 thread
+ -----------   -----------   -----------
+|           | |           | |           |
+|   audio   | |   video   | |   image   |  workers
+|           | |           | |           |
+|           | |           | |           |
+ -----------   -----------   -----------
+  5 threads     5 threads     5 threads
+ -----------   -----------   -----------
+|           | |           | |           |
+|     s3    | |    file   | |    scp    |  uploaders
+|           | |           | |           |
+|           | |           | |           |
+ -----------   -----------   -----------
+  9 threads     1 thread      9 threads
+ -----------   -----------
+|           | |           |
+|synchronize| |  sample   |  notifiers
+|           | |           |
+|           | |           |
+ -----------   -----------
+  1 thread      3 threads
+
+h2. sending avatar
+
+API received @PUT@ @/media/fetch@ call, because this is avatar and user should see it immediately, API cannot respond before end of all conversions. Let say that image file is placed on web page, converter should create 5 new formats and put them on s3.
+
+* image is passed to http downlaoder 
+* image file is processed by image worker - it creates 5 new different files
+* 5 new images are passed to s3 uploader, it has 9 threads so files can be uploaded in parallel
+* message is passed to synchronize notifier which notify API application when all media are ready
+* API responses
+
+h2. sending video file
+
+API received @PUT@ @/media/create@ call. Media file is placed on file system, this is a video, converter should create 9 new formats and put then on different server using @scp@, after that process it should send a request to other application.
+
+* API response that it received message to process
+* media are read from file system by file downloader
+* video file is processed by video worker - it creates 9 new different files
+* 9 new videos are passed to scp uploader, it has 9 threads so files can be uploaded in parallel
+* message is passed to sample notifier which makes a call to inform other application that the media is ready
+
+h1. How does it work - in detail
+
+There are two separated applications API and mediaprocessor, they use one config file which is @config/main.yml@.
+
+h2. API
+
+It is very simple Sinatra application, take a look at sample request: (same as at the bottom):
+
+bc. 
+<media>
+  <image>
+    <source>http://www.google.com/intl/en_ALL/images/srpr/logo1w.png</source>
+    <destination>file:///tmp/test-image.png</destination>
+    <client>sample_client</client>
+    <response_to>http://example.com</response_to>
+    <formats original_format="true">
+      <format>
+  	<suffix>_t</suffix>
+  	<width>150</width>
+  	<height>150</height>
+  	<keep_ratio>true</keep_ratio>
+      </format>
+      <format>
+  	<suffix>_o</suffix>
+  	<width>150</width>
+  	<height>150</height>
+  	<keep_ratio>false</keep_ratio>
+      </format>
+    </formats>
+  </image>
+</media>
+
+p. API passes it to @media_queue@ (from which it is received by mediaprocessr) in parsed form:
+@{"type" -> "image", "source"=>"http://www.google.com/intl/en_ALL/images/srpr/logo1w.png", "destination"=>"file:///tmp/test-image.png", "formats"=>{"original_format"=>"true", "format"=>[{"suffix"=>"_t", "width"=>"150", "height"=>"150", "keep_ratio"=>"true"}, {"suffix"=>"_o", "width"=>"150", "height"=>"150", "keep_ratio"=>"false"}]}}@
+
+API handles three kind of requests:
+# @put "media/fetch"@ - if you want API to wait with response untill media are ready
+# @put "media/create"@ - API responses immediately after receiving request, you can adopt sample notifier to your application or write a new one
+# @get "/"@ - in case you want to check if it still works
+
+h3. message specifications
+
+these parameters are used by different components and different instances, I describe all of them..
+
+* @source@ - specifies source of media
+* @destination@ - specifies target destination of media files
+* @response_to@ - specifies where sample notifier should respond
+* @client@ - specifies who is making a call
+
+formats:
+
+* to upload original file, pass @original_format="true"@ like in the example or 
+
+bc.  
+<formats>
+  <original_format/>
+  <!-- ... -->
+</formats
+
+@suffix@ - to add suffix to destination file name (@foobar.jpg -> foobar_s.jpg@)
+
+h4. image
+
+* @width@
+* @height@
+* @crop_middle@ - decrease that dimension of image which is to big in compare with specified @width@ and @height@ until remaining dimension fit info new size, default is false, has a higher priority than @keep_ratio@
+* @keep_ratio@ - default is true
+
+h4. video 
+
+* @width@ - passes to @-s@ @ffmpeg@ option
+* @height@ - passes to @-s@ @ffmpeg@ option
+* @length@
+* @fps@ - passes to @-r@ @ffmpeg@ option 
+* @extension@ - makes new video with that extension
+
+h5. stills
+
+creates image from one frame of a video, same options line in @image@
+
+h4. audio
+
+* @length@ - audio length
+* @audio_quality@ - passes to @-ab@ @ffmpeg@ option
+* @codec@ - passes to @-acodec@ @ffmpeg@ option
+* @extension@ - makes new audio with that extension
+
+h2. mediaprocessor
+
+@downloader@, @worker@, @uploaded@ and @notifier@ I call components. @image@, @video@ and @audio@ are components instances.
+
+Each component has its config part in main config file - for example @worker-image@ is for instance @image@ of component @worker@. You can specify how many threads you want to run for each instance and other parameters which are accessible by variable config.
+
+h3. Step by step
+
+Start from file @media.rb@ and take a look at these instructions
+
+# @MediaProcessor.prepare_components([:worker, :notifier, :uploader, :downloader])@
+## demonizing application
+## for each component (@[:worker, :notifier, :uploader, :downloader]@)
+### makes class variables - Hash of Arrays to keep threads for each component (@component-name-pluralized[components_name]@ is on array of threads) and Hash of Queues (@component-name-pluralized[component_name]@ is queue to keep messages for component_name)
+### @function component(component_sym)@
+#### defines method named @component_sym@
+##### function @lunch_something@ is invoked
+###### invokes one thread (or more if specified in config file) which takes message from proper queue and pass it to given block
+### load files from proper directories, for example component worker has its instances in @./workers/@ directory (@./wokrers/video.rb@)
+### definition of worker looks like this:
+@worker :video { |message, config| puts message }@
+it invokes function which was defined in step 1.2.2.1 (@component_sym@ in this case is @worker@)
+this worker prints every message which you will pass to @workers_queues[:video]@, also it has access to all config data which are stored with key @:workers-video@ in config file
+# infinite loop over messages from media_queue (based on @PStore@, look into @lib/media_queue.rb@)
+## passing messages to process (vide @implementation.rb@)
+
+h3. Functions for interactions between components
+
+In file @implementation.rb@ I have defined some functions which provide routines for interactions between components. There are:
+
+* @process@
+takes message and passes it to proper @downloader@ (for example if the source looks like that: @http://example.com/image1.jpg@, message will be passed to @http@ downloader)
+* @add_result_spec@
+invoked in @worker@ component passes information about media files (like video length or quality) and number of files that will be created (will be used in @finalize_result_collection@ function)
+* @add_result@
+can be invoked in every component, stores information about finished job
+* @add_error@
+can be invoked in every component, stores error information
+* @finalize_result_collection@
+checks if all files have been processed (remember that in http downloader it's only one file but image worker cat create many different images from it and all of them have to be processed by workers and uploaders), if number of results and errors is equal with number which was passed to @add_result_spec@ function, message is passed to proper notifier
+
+h3. synchronize notifier
+
+This is a special type of notifier - take a look how to send avatar at the top. As a "semaphore" it uses @PStore@ file.
+
+h1. Try it
+
+Clone application, install all dependencies and run API on you favourite server or just use @rackup@:
+@rackup -o 0.0.0.0 -p 9393@
+
+run mediaprocessor on @ruby >=1.9.1@:
+@ruby media.rb@ it should demonize
+
+copy api request from the bottom of this page to @api-request.xml@ and run
+@RestClient.put "http://localhost:9393/media/fetch", File.read("api-request.xml")@
+
+enjoy!
+
+h1. Dependencies
+
+h2. Ruby
+
+You need @Ruby 1.9.1@ for mediaprocessor and @1.8.7@ for API
+
+Install @bundler@ and run @bundle install@
+
+Bundlers @Gemfile@ is divided into 3 parts:
+
+h3. mediaprocessor
+
+* rmagick - for images conversions
+* aws - for aws s3 support
+* rest-client - for easier and more robust http rest requests
+* activesupport - for some magic
+
+h3. API
+
+* sinatra
+
+h3. default
+
+* xml-simple - parsing incoming end generating outgoing xml messages
+* addressable - because URI class from stdlib is not as flexible as I need (support for "s3://", "scp://" etc)
+
+h2. System dependencies
+
+* Debian:
+@apt-get install ffmpeg libmagickcore-dev libmagickwand-dev libopenssl-ruby1.9.1@
+
+* Arch:
+@pacman -S ruby ffmpeg imagemagick@
+
+It is highly recommended to have this packages up to date
+
+h1. Sample API requests
+
+* Image request
+
+bc.. <?xml version="1.0" encoding="UTF-8"?>
+<media>
+  <image>
+    <source>http://www.google.com/intl/en_ALL/images/srpr/logo1w.png</source>
+    <destination>file:///tmp/test-image.png</destination>
+    <client>sample_client</client>
+    <response_to>http://example.com</response_to>
+    <formats original_format="true">
+      <format>
+  	<suffix>_t</suffix>
+  	<width>150</width>
+  	<height>150</height>
+  	<crop_middle>true</crop_middle>
+      </format>
+      <format>
+  	<suffix>_o</suffix>
+  	<width>150</width>
+  	<height>150</height>
+  	<keep_ratio>false</keep_ratio>
+      </format>
+    </formats>
+  </image>
+</media>
+
+* Video request
+
+bc.. <?xml version="1.0" encoding="UTF-8"?>
+<media>
+  <video>
+    <source>http://example.com/clock.avi</source>
+    <destination>file:///tmp/file1.avi</destination>
+    <client>sample_client</client>
+    <response_to>http://example.com</response_to>
+    <formats original_format="true">
+      <format>
+  	<extension>flv</extension>
+  	<width>800</width>
+  	<height>600</height>
+  	<length>10</length>
+  	<fps>25</fps>
+  	<stills>
+  	  <still>
+  	    <destination>/tmp/file1-still1.avi</destination>
+  	    <suffix>_a</suffix>
+  	    <width>150</width>
+  	    <height>150</height>
+  	    <keep_ratio>true</keep_ratio>
+  	  </still>
+  	  <still>
+  	    <destination>/tmp/file1-still2.avi</destination>
+  	    <suffix>_b</suffix>
+  	    <width>1200</width>
+  	    <height>300</height>
+  	    <keep_ratio>false</keep_ratio>
+  	  </still>
+  	</stills>
+      </format>
+    </formats>
+  </video>
+</media>
+
+* Audio request
+
+bc.. <?xml version="1.0" encoding="UTF-8"?>
+<media>
+  <audio>
+    <source>http://example.com/music.mp3</source>
+    <destination>file:///tmp/test1.mp3</destination>
+    <client>sample_client</client>
+    <response_to>http://example.com</response_to>
+    <formats>
+      <original_format/>
+      <format>
+  	<suffix>_w</suffix>
+  	<length>10</length>
+  	<audio_quality>192</audio_quality>
+  	<codec>libmp3lame</codec>
+  	<extension>mp3</extension>
+      </format>
+    </formats>
+  </audio>
+</media>
+

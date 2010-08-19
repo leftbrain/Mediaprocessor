@@ -1,0 +1,23 @@
+media_queue_file: "media_queue.pstore"
+pid_path: "./log/"
+logger_path: "./log/"
+downloader-file:
+  threads:
+downloader-http:
+  threads:
+notifier-synchronize:
+  sync_state_file: "synchronize.pstore"
+notifier-sample:
+  threads:
+uploader-s3:
+  access_key_id:
+  secret_access_key:
+  threads:
+uploader-scp:
+  threads:
+worker-audio:
+  threads:
+worker-image:
+  threads:
+worker-video:
+  threads:
